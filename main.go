@@ -16,6 +16,39 @@ import (
 )
 
 var toolsListIDs sync.Map
+var initializeIDs sync.Map
+var negotiatedProtocolVersion atomic.Value
+var sessionID atomic.Value
+
+// extractPerRequestProtocolVersion extracts the protocol version from a
+// JSON-RPC request's params._meta.io.modelcontextprotocol/protocolVersion
+// field, as defined by the 2026-07-28 spec. Returns "" if not present
+// (i.e., the request uses the 2025-11-25 or earlier format).
+func extractPerRequestProtocolVersion(reqMap map[string]interface{}) string {
+        if params, ok := reqMap["params"].(map[string]interface{}); ok {
+                if meta, ok := params["_meta"].(map[string]interface{}); ok {
+                        if pv, ok := meta["io.modelcontextprotocol/protocolVersion"].(string); ok {
+                                return pv
+                        }
+                }
+        }
+        return ""
+}
+
+// setProtocolVersionHeader sets the MCP-Protocol-Version header on an outgoing
+// HTTP request. It prefers the per-request version from _meta (2026-07-28),
+// falling back to the version negotiated during initialize/discover (2025-11-25).
+func setProtocolVersionHeader(req *http.Request, perRequestVersion string) {
+        pv := perRequestVersion
+        if pv == "" {
+                if v, ok := negotiatedProtocolVersion.Load().(string); ok {
+                        pv = v
+                }
+        }
+        if pv != "" {
+                req.Header.Set("MCP-Protocol-Version", pv)
+        }
+}
 
 func main() {
         if len(os.Args) < 3 {
@@ -36,6 +69,9 @@ func main() {
                 fmt.Fprintf(os.Stderr, "[mcp-bridge] [%s] Invalid URL: %v\n", prefix, err)
                 os.Exit(1)
         }
+
+        negotiatedProtocolVersion.Store("")
+        sessionID.Store("")
 
         switch transport {
         case "sse":
@@ -59,12 +95,15 @@ func runStreamableTransport(prefix string, targetURL *url.URL, token string) {
                 raw := bytes.Clone(scanner.Bytes()) // Clone to prevent buffer reuse mutation [1.1]
 
                 var reqMap map[string]interface{}
-                if err := json.Unmarshal(raw, &reqMap); err == nil {
+                parseErr := json.Unmarshal(raw, &reqMap)
+                if parseErr == nil {
                         method, _ := reqMap["method"].(string)
                         id := reqMap["id"]
 
                         if method == "tools/list" && id != nil {
                                 toolsListIDs.Store(fmt.Sprintf("%v", id), struct{}{}) // Store empty struct, not bool [1.1]
+                        } else if (method == "initialize" || method == "server/discover") && id != nil {
+                                initializeIDs.Store(fmt.Sprintf("%v", id), struct{}{})
                         } else if method == "tools/call" {
                                 if params, ok := reqMap["params"].(map[string]interface{}); ok {
                                         if name, ok := params["name"].(string); ok {
@@ -77,10 +116,18 @@ func runStreamableTransport(prefix string, targetURL *url.URL, token string) {
                         }
                 }
 
+                perRequestPV := ""
+                if parseErr == nil {
+                        perRequestPV = extractPerRequestProtocolVersion(reqMap)
+                }
+
                 req, _ := http.NewRequest("POST", targetURL.String(), bytes.NewReader(raw))
                 req.Header.Set("Content-Type", "application/json")
                 req.Header.Set("Accept", "application/json, text/event-stream")
-                req.Header.Set("MCP-Protocol-Version", "2026-07-28") // Required by July 2026 spec
+                setProtocolVersionHeader(req, perRequestPV)
+                if sid, ok := sessionID.Load().(string); ok && sid != "" {
+                        req.Header.Set("Mcp-Session-Id", sid)
+                }
                 if token != "" {
                         req.Header.Set("Authorization", "Bearer "+token)
                 }
@@ -93,6 +140,12 @@ func runStreamableTransport(prefix string, targetURL *url.URL, token string) {
 
                 if resp.StatusCode >= 400 {
                         fmt.Fprintf(os.Stderr, "[mcp-bridge] [%s] HTTP Error %d\n", prefix, resp.StatusCode)
+                }
+
+                // Capture session ID from response if present (2025-11-25 §Session Management)
+                if sid := resp.Header.Get("Mcp-Session-Id"); sid != "" {
+                        sessionID.Store(sid)
+                        fmt.Fprintf(os.Stderr, "[mcp-bridge] [%s] Session ID: %s\n", prefix, sid)
                 }
 
                 contentType := resp.Header.Get("Content-Type")
@@ -225,12 +278,15 @@ func runSSETransport(prefix string, sseURL *url.URL, token string) {
                 raw := bytes.Clone(scanner.Bytes()) // Clone to prevent buffer reuse mutation [1.1]
 
                 var reqMap map[string]interface{}
-                if err := json.Unmarshal(raw, &reqMap); err == nil {
+                parseErr := json.Unmarshal(raw, &reqMap)
+                if parseErr == nil {
                         method, _ := reqMap["method"].(string)
                         id := reqMap["id"]
 
                         if method == "tools/list" && id != nil {
                                 toolsListIDs.Store(fmt.Sprintf("%v", id), struct{}{}) // Store empty struct [1.1]
+                        } else if (method == "initialize" || method == "server/discover") && id != nil {
+                                initializeIDs.Store(fmt.Sprintf("%v", id), struct{}{})
                         } else if method == "tools/call" {
                                 if params, ok := reqMap["params"].(map[string]interface{}); ok {
                                         if name, ok := params["name"].(string); ok {
@@ -243,9 +299,18 @@ func runSSETransport(prefix string, sseURL *url.URL, token string) {
                         }
                 }
 
+                perRequestPV := ""
+                if parseErr == nil {
+                        perRequestPV = extractPerRequestProtocolVersion(reqMap)
+                }
+
                 target := currentPostURL.Load().(string) // Safe atomic read [1.1]
                 req, _ := http.NewRequest("POST", target, bytes.NewReader(raw))
                 req.Header.Set("Content-Type", "application/json")
+                setProtocolVersionHeader(req, perRequestPV)
+                if sid, ok := sessionID.Load().(string); ok && sid != "" {
+                        req.Header.Set("Mcp-Session-Id", sid)
+                }
                 if token != "" {
                         req.Header.Set("Authorization", "Bearer "+token)
                 }
@@ -260,6 +325,12 @@ func runSSETransport(prefix string, sseURL *url.URL, token string) {
                         fmt.Fprintf(os.Stderr, "[mcp-bridge] [%s] POST returned HTTP %d\n", prefix, resp.StatusCode)
                 }
 
+                // Capture session ID from POST response if present
+                if sid := resp.Header.Get("Mcp-Session-Id"); sid != "" {
+                        sessionID.Store(sid)
+                        fmt.Fprintf(os.Stderr, "[mcp-bridge] [%s] Session ID: %s\n", prefix, sid)
+                }
+
                 // Ensure body is drained for connection reuse [1.1]
                 io.Copy(io.Discard, resp.Body)
                 resp.Body.Close()
@@ -270,10 +341,25 @@ func runSSETransport(prefix string, sseURL *url.URL, token string) {
 }
 
 func handleIncomingMessage(data []byte, prefix string) {
+        // Skip empty responses (e.g., 202 Accepted with no body for notifications)
+        if len(bytes.TrimSpace(data)) == 0 {
+                return
+        }
+
         var respMap map[string]interface{}
         if err := json.Unmarshal(data, &respMap); err == nil {
                 if id := respMap["id"]; id != nil {
                         idStr := fmt.Sprintf("%v", id)
+
+                        if _, exists := initializeIDs.Load(idStr); exists {
+                                initializeIDs.Delete(idStr)
+                                if result, ok := respMap["result"].(map[string]interface{}); ok {
+                                        if pv, ok := result["protocolVersion"].(string); ok {
+                                                negotiatedProtocolVersion.Store(pv)
+                                                fmt.Fprintf(os.Stderr, "[mcp-bridge] [%s] Negotiated protocol version: %s\n", prefix, pv)
+                                        }
+                                }
+                        }
 
                         if _, exists := toolsListIDs.Load(idStr); exists {
                                 toolsListIDs.Delete(idStr)

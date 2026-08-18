@@ -111,6 +111,20 @@ mcp-bridge <prefix> <url>
 | `MCP_TRANSPORT` | `sse` *(default)*, `streamable` / `http` | Defines the transport protocol to use for the upstream server. |
 | `MCP_BEARER_TOKEN` | *string (optional)* | Bearer token sent via the `Authorization: Bearer <token>` header. |
 
+### Protocol Version Negotiation
+
+The bridge automatically handles protocol version for both the 2025-11-25 and 2026-07-28 MCP specs:
+
+- **2025-11-25 style**: Captures the `protocolVersion` from the server's `initialize` response and sets the `MCP-Protocol-Version` header on all subsequent requests.
+- **2026-07-28 style**: Extracts `io.modelcontextprotocol/protocolVersion` from each request's `params._meta` and sets the matching `MCP-Protocol-Version` header. This is the per-request version negotiation approach introduced in the 2026-07-28 spec.
+- **Fallback**: If neither is available (e.g., before `initialize` response arrives), the header is omitted — servers default to their supported version.
+
+The bridge also tracks `server/discover` requests (the 2026-07-28 replacement for `initialize`).
+
+### Session Management
+
+The bridge captures the `Mcp-Session-Id` header from server responses (including `initialize`/`server/discover` responses) and includes it in all subsequent HTTP requests. This ensures compatibility with stateful servers that require session IDs.
+
 ---
 
 ## 🔍 How It Works
