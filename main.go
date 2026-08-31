@@ -19,6 +19,7 @@ var toolsListIDs sync.Map
 var initializeIDs sync.Map
 var negotiatedProtocolVersion atomic.Value
 var sessionID atomic.Value
+var initialized atomic.Value
 
 // extractPerRequestProtocolVersion extracts the protocol version from a
 // JSON-RPC request's params._meta.io.modelcontextprotocol/protocolVersion
@@ -72,6 +73,7 @@ func main() {
 
         negotiatedProtocolVersion.Store("")
         sessionID.Store("")
+        initialized.Store(false)
 
         switch transport {
         case "sse":
@@ -92,7 +94,7 @@ func runStreamableTransport(prefix string, targetURL *url.URL, token string) {
         client := &http.Client{Timeout: 30 * time.Second} // Add reasonable timeout to prevent hang [1.1]
 
         for scanner.Scan() {
-                raw := bytes.Clone(scanner.Bytes()) // Clone to prevent buffer reuse mutation [1.1]
+                raw := make([]byte, len(scanner.Bytes())); copy(raw, scanner.Bytes()) // Clone to prevent buffer reuse mutation [1.1]
 
                 var reqMap map[string]interface{}
                 parseErr := json.Unmarshal(raw, &reqMap)
@@ -112,6 +114,16 @@ func runStreamableTransport(prefix string, targetURL *url.URL, token string) {
                                                         raw, _ = json.Marshal(reqMap)
                                                 }
                                         }
+                                }
+                        }
+                }
+
+                // Gate tools/call until initialize completes
+                if parseErr == nil {
+                        if method, _ := reqMap["method"].(string); method == "tools/call" {
+                                if init, _ := initialized.Load().(bool); !init {
+                                        fmt.Fprintf(os.Stderr, "[mcp-bridge] [%s] Dropping tools/call before initialize\n", prefix)
+                                        continue
                                 }
                         }
                 }
@@ -275,7 +287,7 @@ func runSSETransport(prefix string, sseURL *url.URL, token string) {
         postClient := &http.Client{Timeout: 30 * time.Second}
 
         for scanner.Scan() {
-                raw := bytes.Clone(scanner.Bytes()) // Clone to prevent buffer reuse mutation [1.1]
+                raw := make([]byte, len(scanner.Bytes())); copy(raw, scanner.Bytes()) // Clone to prevent buffer reuse mutation [1.1]
 
                 var reqMap map[string]interface{}
                 parseErr := json.Unmarshal(raw, &reqMap)
@@ -295,6 +307,16 @@ func runSSETransport(prefix string, sseURL *url.URL, token string) {
                                                         raw, _ = json.Marshal(reqMap)
                                                 }
                                         }
+                                }
+                        }
+                }
+
+                // Gate tools/call until initialize completes
+                if parseErr == nil {
+                        if method, _ := reqMap["method"].(string); method == "tools/call" {
+                                if init, _ := initialized.Load().(bool); !init {
+                                        fmt.Fprintf(os.Stderr, "[mcp-bridge] [%s] Dropping tools/call before initialize\n", prefix)
+                                        continue
                                 }
                         }
                 }
@@ -353,6 +375,7 @@ func handleIncomingMessage(data []byte, prefix string) {
 
                         if _, exists := initializeIDs.Load(idStr); exists {
                                 initializeIDs.Delete(idStr)
+                                initialized.Store(true)
                                 if result, ok := respMap["result"].(map[string]interface{}); ok {
                                         if pv, ok := result["protocolVersion"].(string); ok {
                                                 negotiatedProtocolVersion.Store(pv)
