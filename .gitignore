@@ -1,1 +1,2 @@
-mcp-bridge
+secrets.env
+*.log
