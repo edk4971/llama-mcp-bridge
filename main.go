@@ -30,11 +30,34 @@ func (a *authRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) 
 
 func main() {
 	if len(os.Args) < 3 {
-		fmt.Fprintf(os.Stderr, "Usage: mcp-bridge <prefix> <url>\n")
+		fmt.Fprintf(os.Stderr, "Usage: mcp-bridge <prefix> <url> [log]\n")
 		os.Exit(1)
 	}
 	prefix := os.Args[1]
 	urlStr := os.Args[2]
+
+	logEnabled := false
+	var logFile *os.File
+	var log func(string)
+	if len(os.Args) >= 4 && os.Args[3] == "log" {
+		logPath := os.Getenv("LOGFILE")
+		if logPath == "" {
+			logPath = "/config/mcp-bridge.log"
+		}
+		f, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+		if err == nil {
+			logFile = f
+			logEnabled = true
+		}
+	}
+	if logEnabled {
+		defer logFile.Close()
+		log = func(s string) {
+			logFile.WriteString(s + "\n")
+		}
+	} else {
+		log = func(s string) {}
+	}
 
 	transportType := strings.ToLower(os.Getenv("MCP_TRANSPORT"))
 	if transportType == "" {
@@ -72,6 +95,7 @@ func main() {
 	scanner := bufio.NewScanner(os.Stdin)
 	for scanner.Scan() {
 		line := scanner.Bytes()
+		log("IN:" + string(line))
 		if len(line) == 0 {
 			continue
 		}
@@ -83,6 +107,26 @@ func main() {
 		id := req["id"]
 
 		switch method {
+		case "initialize":
+			resp := map[string]interface{}{
+				"jsonrpc": "2.0",
+				"id":      id,
+				"result": map[string]interface{}{
+					"protocolVersion": "2024-11-05",
+					"capabilities": map[string]interface{}{
+						"tools": map[string]interface{}{"listChanged": false},
+					},
+					"serverInfo": map[string]interface{}{
+						"name":    prefix,
+						"version": "1.0",
+					},
+				},
+			}
+			if out, _ := json.Marshal(resp); true {
+				s := string(out)
+				log("OUT:" + s)
+				fmt.Println(s)
+			}
 		case "tools/list":
 			tools, err := session.ListTools(ctx, nil)
 			if err != nil {
@@ -90,8 +134,12 @@ func main() {
 			}
 			toolsOut := []map[string]interface{}{}
 			for _, t := range tools.Tools {
+				name := t.Name
+				if !strings.HasPrefix(name, prefix+"_") {
+					name = prefix + "_" + t.Name
+				}
 				toolsOut = append(toolsOut, map[string]interface{}{
-					"name":        prefix + "_" + t.Name,
+					"name":        name,
 					"description": t.Description,
 				})
 			}
@@ -103,7 +151,9 @@ func main() {
 				},
 			}
 			if out, _ := json.Marshal(resp); true {
-				fmt.Println(string(out))
+				s := string(out)
+				log("OUT:" + s)
+				fmt.Println(s)
 			}
 		case "tools/call":
 			params, _ := req["params"].(map[string]interface{})
@@ -128,7 +178,9 @@ func main() {
 				},
 			}
 			if out, _ := json.Marshal(resp); true {
-				fmt.Println(string(out))
+				s := string(out)
+				log("OUT:" + s)
+				fmt.Println(s)
 			}
 		}
 	}

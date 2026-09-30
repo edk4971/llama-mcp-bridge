@@ -7,7 +7,7 @@ A lightweight Go bridge that connects `llama.cpp` and other stdio-only MCP clien
 ## Features
 
 - **Protocol Agnostic:** Supports legacy MCP SSE and modern Streamable HTTP. Transport is selected via `MCP_TRANSPORT`.
-- **Automatic Namespacing:** Prefixes tool names `prefix_<name>` to prevent collisions.
+- **Automatic Namespacing:** Prefixes tool names `prefix_<name>` to prevent collisions. If a tool name already starts with `prefix_`, it is left unchanged to avoid double-prefixing.
 - **Secure Authentication:** Bearer token via `MCP_BEARER_TOKEN` injected via HTTP client transport.
 - **Zero Runtime Dependencies:** Single static binary, no external runtime required.
 - **Spec Compliant:** Uses official go-sdk for transport, session management, protocol version negotiation, and per-request headers.
@@ -27,12 +27,15 @@ go build -ldflags="-w -s" -tags nostderr -o mcp-bridge .
 ## Usage
 
 ```bash
-mcp-bridge <prefix> <url>
+mcp-bridge <prefix> <url> [log]
 ```
 
 Environment variables:
 - `MCP_TRANSPORT` = `sse` | `streamable` | `http`  (default `sse`)
 - `MCP_BEARER_TOKEN` = Bearer token for auth
+- `LOGFILE` = path for stdio logging when third arg is `log`  (default `/config/mcp-bridge.log`)
+
+Optional third argument `log` enables stdio logging of inbound/outbound JSON-RPC to `LOGFILE`.
 
 ### llama.cpp example
 
@@ -53,9 +56,9 @@ Mount the binary into the llama.cpp container and pass `--mcp-servers-config`.
 
 ## Architecture
 
-- Local side: reads JSON-RPC from stdin, writes to stdout
+- Local side: reads JSON-RPC from stdin, writes to stdout, handles `initialize` reply locally
 - Remote side: `mcp.Client` with `SSEClientTransport` or `StreamableClientTransport`
-- Tools are listed via SDK, names are prefixed, calls are forwarded with prefix stripped
+- Tools are listed via SDK, names are prefixed unless already prefixed, calls are forwarded with prefix stripped
 
 ## Notes
 
